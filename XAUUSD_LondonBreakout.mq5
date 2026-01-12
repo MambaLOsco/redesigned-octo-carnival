@@ -10,6 +10,7 @@
 //--- Input parameters -------------------------------------------------
 input string TELEGRAM_TOKEN      = "";        // Telegram bot token from @BotFather
 input string TELEGRAM_CHAT_ID    = "";        // Telegram chat/channel identifier (can be negative)
+input string TradeSymbol         = _Symbol;   // Symbol to trade (supports broker suffixes)
 input bool   EnableTrading       = false;     // Enable automated order placement
 input long   MagicNumber         = 123456;    // Magic number for identifying EA trades
 input ENUM_TIMEFRAMES RangeTF    = PERIOD_M15;// Timeframe used to compute Asian range and indicators
@@ -17,6 +18,8 @@ input int    AsianStartHour      = 0;         // Start hour of the Asian session
 input int    AsianEndHour        = 7;         // Exclusive end hour of the Asian session
 input int    TradeStartHour      = 8;         // London session start hour (pending order placement)
 input int    TradeEndHour        = 12;        // London session end hour (cancel unfilled orders)
+input bool   UseGMT              = false;     // Use GMT time basis instead of server time
+input int    ManualGMTOffsetHours= 0;         // GMT offset hours to subtract from server time when UseGMT=true
 input int    EMAPeriod           = 200;       // EMA period for directional bias
 input int    RSIperiod           = 14;        // RSI period for momentum filter
 input int    RSILongMin          = 55;        // Minimum RSI value for long confirmation
@@ -32,6 +35,8 @@ input bool   MoveToBE_At1R       = true;      // Move stop to break-even at 1R
 input bool   TrailAfter1R        = true;      // Trail stop after break-even using ATR
 input double Trail_ATR_mult      = 1.0;       // ATR multiplier for trailing stop distance
 input int    Slippage            = 30;        // Maximum slippage in points when sending orders
+input int    MinSLUpdatePoints   = 30;        // Minimum SL change in points to modify
+input int    MinSLUpdateSeconds  = 20;        // Minimum seconds between SL modifications
 
 //--- Indicator handles ------------------------------------------------
 int  g_handleEMA = INVALID_HANDLE;
@@ -47,17 +52,17 @@ bool     g_RangeAnnounced     = false;
 
 //--- Pending order and trade state -----------------------------------
 bool     g_TradePlacedToday   = false;
+bool     g_SignalSentBuyToday = false;
+bool     g_SignalSentSellToday= false;
 bool     g_PositionActive     = false;
 bool     g_MoveToBE_Done      = false;
 double   g_LastRiskDistance   = 0.0;
 double   g_LastEntryPrice     = 0.0;
 double   g_LastStopLoss       = 0.0;
+datetime g_LastSLUpdateTime   = 0;
 
 ulong    g_BuyStopTicket      = 0;
 ulong    g_SellStopTicket     = 0;
-
-//--- Constants --------------------------------------------------------
-const string SYMBOL_NAME = "XAUUSD";
 
 //+------------------------------------------------------------------+
 //| Escape special characters for JSON payloads                     |
@@ -87,21 +92,41 @@ bool SendTelegram(const string message)
    string escaped = JsonEscape(message);
    string payload = StringFormat("{\"chat_id\":\"%s\",\"text\":\"%s\",\"parse_mode\":\"HTML\",\"disable_web_page_preview\":true}",
                                  TELEGRAM_CHAT_ID, escaped);
-   char data[];
-   StringToCharArray(payload, data);
+   uchar data[];
+   StringToCharArray(payload, data, 0, WHOLE_ARRAY, CP_UTF8);
 
-   char result[];
-   string headers;
+   uchar result[];
+   string headers = "Content-Type: application/json\r\n";
+   string response_headers;
    int timeout = 5000;
-   int status = WebRequest("POST", url, "application/json", timeout, data, result, headers);
+   int status = WebRequest("POST", url, headers, timeout, data, result, response_headers);
+   string response = CharArrayToString(result, 0, -1, CP_UTF8);
 
    if(status != 200)
    {
-      PrintFormat("[Telegram] WebRequest status %d, response: %s", status, CharArrayToString(result));
+      PrintFormat("[Telegram] WebRequest status %d, error %d, response: %s", status, GetLastError(), response);
       return false;
    }
 
    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Time helpers (server/GMT basis)                                  |
+//+------------------------------------------------------------------+
+datetime GetBasisTime()
+{
+   datetime now = TimeCurrent();
+   if(UseGMT)
+      return now - (ManualGMTOffsetHours * 3600);
+   return now;
+}
+
+datetime ToServerTime(const datetime basisTime)
+{
+   if(UseGMT)
+      return basisTime + (ManualGMTOffsetHours * 3600);
+   return basisTime;
 }
 
 //+------------------------------------------------------------------+
@@ -111,7 +136,7 @@ bool EnsureIndicators()
 {
    if(g_handleEMA == INVALID_HANDLE)
    {
-      g_handleEMA = iMA(SYMBOL_NAME, RangeTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      g_handleEMA = iMA(TradeSymbol, RangeTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
       if(g_handleEMA == INVALID_HANDLE)
       {
          Print("Failed to create EMA handle");
@@ -121,7 +146,7 @@ bool EnsureIndicators()
 
    if(g_handleRSI == INVALID_HANDLE)
    {
-      g_handleRSI = iRSI(SYMBOL_NAME, RangeTF, RSIperiod, PRICE_CLOSE);
+      g_handleRSI = iRSI(TradeSymbol, RangeTF, RSIperiod, PRICE_CLOSE);
       if(g_handleRSI == INVALID_HANDLE)
       {
          Print("Failed to create RSI handle");
@@ -131,7 +156,7 @@ bool EnsureIndicators()
 
    if(g_handleATR == INVALID_HANDLE)
    {
-      g_handleATR = iATR(SYMBOL_NAME, RangeTF, ATRperiod);
+      g_handleATR = iATR(TradeSymbol, RangeTF, ATRperiod);
       if(g_handleATR == INVALID_HANDLE)
       {
          Print("Failed to create ATR handle");
@@ -165,11 +190,14 @@ void ResetDailyState(const datetime dayStart)
    g_RangeCalculated  = false;
    g_RangeAnnounced   = false;
    g_TradePlacedToday = false;
+   g_SignalSentBuyToday = false;
+   g_SignalSentSellToday = false;
    g_PositionActive   = false;
    g_MoveToBE_Done    = false;
    g_LastRiskDistance = 0.0;
    g_LastEntryPrice   = 0.0;
    g_LastStopLoss     = 0.0;
+   g_LastSLUpdateTime = 0;
 
    g_BuyStopTicket    = 0;
    g_SellStopTicket   = 0;
@@ -183,7 +211,7 @@ bool CalcAsianRange()
    if(g_RangeCalculated)
       return true;
 
-   datetime now = TimeCurrent();
+   datetime now = GetBasisTime();
    MqlDateTime tm;
    TimeToStruct(now, tm);
    if(tm.hour < AsianEndHour)
@@ -195,9 +223,11 @@ bool CalcAsianRange()
 
    datetime rangeStart = dayStart + AsianStartHour * 3600;
    datetime rangeEnd   = dayStart + AsianEndHour * 3600;
+   datetime rangeStartServer = ToServerTime(rangeStart);
+   datetime rangeEndServer   = ToServerTime(rangeEnd);
 
    MqlRates rates[];
-   int copied = CopyRates(SYMBOL_NAME, RangeTF, rangeStart, rangeEnd, rates);
+   int copied = CopyRates(TradeSymbol, RangeTF, rangeStartServer, rangeEndServer, rates);
    if(copied <= 0)
    {
       Print("Failed to copy rates for Asian range");
@@ -209,7 +239,7 @@ bool CalcAsianRange()
 
    for(int i = 0; i < copied; ++i)
    {
-      if(rates[i].time >= rangeStart && rates[i].time < rangeEnd)
+      if(rates[i].time >= rangeStartServer && rates[i].time < rangeEndServer)
       {
          high = MathMax(high, rates[i].high);
          low  = MathMin(low,  rates[i].low);
@@ -224,7 +254,7 @@ bool CalcAsianRange()
    g_RangeCalculated = true;
 
    string msg = StringFormat("\xF0\x9F\x9F\xA8 <b>Asian Range</b> %s\nHigh: %.2f  Low: %.2f\nWindow: %02d:00-%02d:59",
-                             SYMBOL_NAME, g_AsianHigh, g_AsianLow, AsianStartHour, AsianEndHour - 1);
+                             TradeSymbol, g_AsianHigh, g_AsianLow, AsianStartHour, AsianEndHour - 1);
    if(!g_RangeAnnounced)
    {
       SendTelegram(msg);
@@ -266,16 +296,18 @@ bool GetIndicatorValues(double &emaValue, double &rsiValue, double &atrValue)
 //+------------------------------------------------------------------+
 //| Calculate trade volume based on risk percentage                   |
 //+------------------------------------------------------------------+
-double CalcLotsByRisk(const double entry, const double stopLoss)
+double CalcLotsByRisk(const double entry, const double stopLoss, const ENUM_ORDER_TYPE orderType)
 {
    double riskInMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (RiskPercent / 100.0);
-   double tickValue   = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize    = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_TRADE_TICK_SIZE);
-   double minLot      = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_VOLUME_MIN);
-   double lotStep     = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_VOLUME_STEP);
+   double tickValue   = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize    = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_SIZE);
+   double minLot      = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
+   double maxLot      = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX);
+   double lotStep     = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_STEP);
+   int    lotDigits   = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_VOLUME_DIGITS);
 
    double stopDistance = MathAbs(entry - stopLoss);
-   if(stopDistance <= 0.0 || tickValue <= 0.0 || tickSize <= 0.0)
+   if(stopDistance <= 0.0 || tickValue <= 0.0 || tickSize <= 0.0 || lotStep <= 0.0)
       return 0.0;
 
    double ticks = stopDistance / tickSize;
@@ -283,9 +315,25 @@ double CalcLotsByRisk(const double entry, const double stopLoss)
       return 0.0;
 
    double lot = riskInMoney / (ticks * tickValue);
-   lot = MathMax(minLot, lot);
-   lot = MathFloor(lot / lotStep + 0.5) * lotStep;
-   lot = NormalizeDouble(lot, (int)SymbolInfoInteger(SYMBOL_NAME, SYMBOL_VOLUME_DIGITS));
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathFloor(lot / lotStep) * lotStep;
+   lot = NormalizeDouble(lot, lotDigits);
+
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double margin = 0.0;
+   while(lot >= minLot)
+   {
+      if(!OrderCalcMargin(orderType, TradeSymbol, lot, entry, margin))
+      {
+         Print("OrderCalcMargin failed for volume check");
+         return 0.0;
+      }
+      if(margin <= freeMargin)
+         break;
+      lot = NormalizeDouble(lot - lotStep, lotDigits);
+   }
+   if(lot < minLot)
+      return 0.0;
    return lot;
 }
 
@@ -294,9 +342,9 @@ double CalcLotsByRisk(const double entry, const double stopLoss)
 //+------------------------------------------------------------------+
 bool SpreadOK()
 {
-   double ask = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_BID);
-   double spreadPoints = (ask - bid) / SymbolInfoDouble(SYMBOL_NAME, SYMBOL_POINT);
+   double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+   double spreadPoints = (ask - bid) / SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
    return (spreadPoints <= MaxSpreadPoints);
 }
 
@@ -312,6 +360,20 @@ void CancelPending(const ulong ticket, const string reason)
       return;
 
    if(!OrderSelect(ticket))
+   {
+      PrintFormat("Pending order %I64u not found for cancel", ticket);
+      return;
+   }
+
+   string orderSymbol = OrderGetString(ORDER_SYMBOL);
+   long orderMagic = OrderGetInteger(ORDER_MAGIC);
+   long orderType = OrderGetInteger(ORDER_TYPE);
+   if(orderSymbol != TradeSymbol || orderMagic != MagicNumber)
+      return;
+
+   if(orderType != ORDER_TYPE_BUY_STOP && orderType != ORDER_TYPE_SELL_STOP &&
+      orderType != ORDER_TYPE_BUY_LIMIT && orderType != ORDER_TYPE_SELL_LIMIT &&
+      orderType != ORDER_TYPE_BUY_STOP_LIMIT && orderType != ORDER_TYPE_SELL_STOP_LIMIT)
       return;
 
    MqlTradeRequest request;
@@ -321,7 +383,7 @@ void CancelPending(const ulong ticket, const string reason)
 
    request.action   = TRADE_ACTION_REMOVE;
    request.order    = ticket;
-   request.symbol   = SYMBOL_NAME;
+   request.symbol   = TradeSymbol;
    request.magic    = MagicNumber;
 
    if(!OrderSend(request, result))
@@ -329,7 +391,7 @@ void CancelPending(const ulong ticket, const string reason)
    else
    {
       string msg = StringFormat("\xF0\x9F\x9B\x91 <b>PENDING CANCELED</b> %s Ticket %I64u (%s)",
-                                SYMBOL_NAME, ticket, reason);
+                                TradeSymbol, ticket, reason);
       SendTelegram(msg);
    }
 }
@@ -343,9 +405,17 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
 
    if(!EnableTrading)
    {
-      string msg = StringFormat("\xF0\x9F\x9F\xA2 <b>SIGNAL</b> %s %s\nEntry %.2f | SL %.2f | TP %.2f\nTrading disabled", SYMBOL_NAME, direction, entry, stopLoss, takeProfit);
+      if(isBuy && g_SignalSentBuyToday)
+         return true;
+      if(!isBuy && g_SignalSentSellToday)
+         return true;
+
+      string msg = StringFormat("\xF0\x9F\x9F\xA2 <b>SIGNAL</b> %s %s\nEntry %.2f | SL %.2f | TP %.2f\nTrading disabled", TradeSymbol, direction, entry, stopLoss, takeProfit);
       SendTelegram(msg);
-      g_TradePlacedToday = true;
+      if(isBuy)
+         g_SignalSentBuyToday = true;
+      else
+         g_SignalSentSellToday = true;
       return true;
    }
 
@@ -355,7 +425,48 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
       return false;
    }
 
-   double volume = CalcLotsByRisk(entry, stopLoss);
+   int digits = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_DIGITS);
+   double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+   double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+   int stopsLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int freezeLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   int minLevel = MathMax(stopsLevel, freezeLevel);
+   double minDistance = minLevel * point;
+
+   double normEntry = NormalizeDouble(entry, digits);
+   double normSL = NormalizeDouble(stopLoss, digits);
+   double normTP = NormalizeDouble(takeProfit, digits);
+
+   if(isBuy)
+   {
+      if((normEntry - ask) < minDistance)
+      {
+         Print("Pending buy stop too close to market or within freeze level");
+         return false;
+      }
+      if((normEntry - normSL) < (stopsLevel * point) || (normTP - normEntry) < (stopsLevel * point))
+      {
+         Print("SL/TP distances too close to entry for buy stop");
+         return false;
+      }
+   }
+   else
+   {
+      if((bid - normEntry) < minDistance)
+      {
+         Print("Pending sell stop too close to market or within freeze level");
+         return false;
+      }
+      if((normSL - normEntry) < (stopsLevel * point) || (normEntry - normTP) < (stopsLevel * point))
+      {
+         Print("SL/TP distances too close to entry for sell stop");
+         return false;
+      }
+   }
+
+   ENUM_ORDER_TYPE pendingType = isBuy ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+   double volume = CalcLotsByRisk(normEntry, normSL, pendingType);
    if(volume <= 0.0)
    {
       Print("Calculated lot size invalid");
@@ -368,14 +479,14 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
    ZeroMemory(result);
 
    request.action   = TRADE_ACTION_PENDING;
-   request.symbol   = SYMBOL_NAME;
+   request.symbol   = TradeSymbol;
    request.magic    = MagicNumber;
    request.volume   = volume;
-   request.price    = entry;
-   request.sl       = stopLoss;
-   request.tp       = takeProfit;
+   request.price    = normEntry;
+   request.sl       = normSL;
+   request.tp       = normTP;
    request.deviation= Slippage;
-   request.type     = isBuy ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+   request.type     = pendingType;
    request.type_filling = ORDER_FILLING_RETURN;
 
    if(!OrderSend(request, result))
@@ -399,7 +510,7 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
    g_TradePlacedToday = true;
 
    string msg = StringFormat("\xF0\x9F\xA7\xA2 <b>PENDING SET</b> %s %s @ %.2f\nSL %.2f | TP %.2f | lots %.2f\nTicket %I64u",
-                             SYMBOL_NAME, direction, entry, stopLoss, takeProfit, volume, ticket);
+                             TradeSymbol, direction, normEntry, normSL, normTP, volume, ticket);
    SendTelegram(msg);
    Print(msg);
    return true;
@@ -417,13 +528,13 @@ void TryPlacePendings()
    if(!GetIndicatorValues(emaValue, rsiValue, atrValue))
       return;
 
-   double point  = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_POINT);
+   double point  = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
    double buffer = BufferPoints * point;
    double atrSL  = atrValue * SL_ATR_mult;
 
    double lastClose = 0.0;
    double closeBuffer[1];
-   if(CopyClose(SYMBOL_NAME, RangeTF, 1, 1, closeBuffer) > 0)
+   if(CopyClose(TradeSymbol, RangeTF, 1, 1, closeBuffer) > 0)
       lastClose = closeBuffer[0];
 
    bool emaBull = lastClose > emaValue;
@@ -432,7 +543,7 @@ void TryPlacePendings()
    bool longOK  = (OnlyOneSideTrend ? emaBull : true) && rsiValue >= RSILongMin && emaBull;
    bool shortOK = (OnlyOneSideTrend ? emaBear : true) && rsiValue <= RSIShortMax && emaBear;
 
-   datetime now = TimeCurrent();
+   datetime now = GetBasisTime();
    MqlDateTime tm;
    TimeToStruct(now, tm);
    if(tm.hour < TradeStartHour || tm.hour >= TradeEndHour)
@@ -443,11 +554,12 @@ void TryPlacePendings()
       double entry = g_AsianHigh + buffer;
       double sl    = entry - atrSL;
       double tp    = entry + RR_TP * (entry - sl);
-      if(PlacePending(true, entry, sl, tp))
+      PlacePending(true, entry, sl, tp);
+      if(EnableTrading && g_TradePlacedToday)
          return;
    }
 
-   if(g_TradePlacedToday)
+   if(EnableTrading && g_TradePlacedToday)
       return;
 
    if(shortOK)
@@ -464,7 +576,7 @@ void TryPlacePendings()
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
-   if(!PositionSelect(SYMBOL_NAME))
+   if(!PositionSelect(TradeSymbol))
       return;
 
    if((ulong)PositionGetInteger(POSITION_MAGIC) != (ulong)MagicNumber)
@@ -479,9 +591,9 @@ void ManageOpenPositions()
    double entry      = PositionGetDouble(POSITION_PRICE_OPEN);
    double stopLoss   = PositionGetDouble(POSITION_SL);
    double currentSL  = stopLoss;
-   double point      = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_POINT);
-   double ask        = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_ASK);
-   double bid        = SymbolInfoDouble(SYMBOL_NAME, SYMBOL_BID);
+   double point      = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+   double ask        = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+   double bid        = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
    long   type       = PositionGetInteger(POSITION_TYPE);
 
    double atrValue;
@@ -530,9 +642,11 @@ void ManageOpenPositions()
       }
    }
 
-   currentSL = NormalizeDouble(currentSL, (int)SymbolInfoInteger(SYMBOL_NAME, SYMBOL_DIGITS));
+   int digits = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_DIGITS);
+   currentSL = NormalizeDouble(currentSL, digits);
 
-   if(MathAbs(currentSL - stopLoss) >= point)
+   if(MathAbs(currentSL - stopLoss) >= (MinSLUpdatePoints * point) &&
+      (TimeCurrent() - g_LastSLUpdateTime) >= MinSLUpdateSeconds)
    {
       MqlTradeRequest request;
       MqlTradeResult  result;
@@ -540,7 +654,7 @@ void ManageOpenPositions()
       ZeroMemory(result);
 
       request.action   = TRADE_ACTION_SLTP;
-      request.symbol   = SYMBOL_NAME;
+      request.symbol   = TradeSymbol;
       request.magic    = MagicNumber;
       request.position = PositionGetInteger(POSITION_TICKET);
       request.sl       = currentSL;
@@ -548,11 +662,14 @@ void ManageOpenPositions()
 
       if(OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
       {
-         string msg = StringFormat("\xF0\x9F\x94\xA7 <b>SL UPDATE</b> %s -> %.2f", SYMBOL_NAME, currentSL);
+         string msg = StringFormat("\xF0\x9F\x94\xA7 <b>SL UPDATE</b> %s -> %.2f", TradeSymbol, currentSL);
          SendTelegram(msg);
          Print(msg);
+         g_LastSLUpdateTime = TimeCurrent();
       }
-      else if(result.retcode != TRADE_RETCODE_DONE)
+      else if(result.retcode != TRADE_RETCODE_DONE &&
+              result.retcode != TRADE_RETCODE_REQUOTE &&
+              result.retcode != TRADE_RETCODE_TRADE_CONTEXT_BUSY)
       {
          PrintFormat("Failed to modify position SL. Retcode=%d", result.retcode);
       }
@@ -567,7 +684,7 @@ void CancelExpiredPendings()
    if(!EnableTrading)
       return;
 
-   datetime now = TimeCurrent();
+   datetime now = GetBasisTime();
    MqlDateTime tm;
    TimeToStruct(now, tm);
    if(tm.hour < TradeEndHour)
@@ -592,10 +709,16 @@ int OnInit()
 {
    ResetDailyState(0);
 
+   if(StringLen(TradeSymbol) == 0 || !SymbolSelect(TradeSymbol, true))
+   {
+      Print("TradeSymbol not available or cannot be selected");
+      return INIT_FAILED;
+   }
+
    if(!EnsureIndicators())
       return INIT_FAILED;
 
-   string msg = StringFormat("\xF0\x9F\x9A\x80 <b>EA Started</b> %s\nTrading %s", SYMBOL_NAME, EnableTrading ? "ENABLED" : "DISABLED");
+   string msg = StringFormat("\xF0\x9F\x9A\x80 <b>EA Started</b> %s\nTrading %s", TradeSymbol, EnableTrading ? "ENABLED" : "DISABLED");
    SendTelegram(msg);
    Print(msg);
    return INIT_SUCCEEDED;
@@ -610,7 +733,7 @@ void OnDeinit(const int reason)
    if(g_handleRSI != INVALID_HANDLE) IndicatorRelease(g_handleRSI);
    if(g_handleATR != INVALID_HANDLE) IndicatorRelease(g_handleATR);
 
-   string msg = StringFormat("\xF0\x9F\x9B\x91 <b>EA Stopped</b> %s (reason %d)", SYMBOL_NAME, reason);
+   string msg = StringFormat("\xF0\x9F\x9B\x91 <b>EA Stopped</b> %s (reason %d)", TradeSymbol, reason);
    SendTelegram(msg);
    Print(msg);
 }
@@ -620,10 +743,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(Symbol() != SYMBOL_NAME)
-      return;
-
-   datetime now = TimeCurrent();
+   datetime now = GetBasisTime();
    MqlDateTime tm;
    TimeToStruct(now, tm);
    datetime dayStart = now - (tm.hour * 3600 + tm.min * 60 + tm.sec);
@@ -644,7 +764,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   if(trans.symbol != SYMBOL_NAME)
+   if(trans.symbol != TradeSymbol)
       return;
 
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
@@ -665,14 +785,14 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          g_LastEntryPrice = price;
          g_LastRiskDistance = 0.0;
 
-         if(PositionSelect(SYMBOL_NAME) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         if(PositionSelect(TradeSymbol) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          {
             g_LastStopLoss = PositionGetDouble(POSITION_SL);
             g_LastRiskDistance = MathAbs(PositionGetDouble(POSITION_PRICE_OPEN) - g_LastStopLoss);
          }
 
          string msg = StringFormat("\xE2\x9C\x85 <b>ENTRY</b> %s %s @ %.2f (deal %I64u)",
-                                   SYMBOL_NAME,
+                                   TradeSymbol,
                                    (dealType == DEAL_TYPE_BUY ? "BUY" : "SELL"),
                                    price, dealTicket);
          SendTelegram(msg);
@@ -693,7 +813,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       {
          string label = (dealType == DEAL_TYPE_TP) ? "TP" : (dealType == DEAL_TYPE_SL ? "SL" : "CLOSE");
          string msg = StringFormat("\xF0\x9F\x94\x9A <b>%s</b> %s @ %.2f | P/L %.2f",
-                                   label, SYMBOL_NAME, price, profit);
+                                   label, TradeSymbol, price, profit);
          SendTelegram(msg);
          Print(msg);
          g_PositionActive = false;
