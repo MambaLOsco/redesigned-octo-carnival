@@ -18,8 +18,8 @@ input int    AsianStartHour      = 0;         // Start hour of the Asian session
 input int    AsianEndHour        = 7;         // Exclusive end hour of the Asian session
 input int    TradeStartHour      = 8;         // London session start hour (pending order placement)
 input int    TradeEndHour        = 12;        // London session end hour (cancel unfilled orders)
-input bool   UseGMT              = false;     // Use GMT time basis instead of server time
-input int    ManualGMTOffsetHours= 0;         // GMT offset hours to subtract from server time when UseGMT=true
+input bool   UseGMT              = false;     // Use GMT session times (converted to broker time dynamically)
+input int    ManualGMTOffsetHours= 0;         // Optional manual offset in hours added to dynamic GMT->server offset
 input int    EMAPeriod           = 200;       // EMA period for directional bias
 input int    RSIperiod           = 14;        // RSI period for momentum filter
 input int    RSILongMin          = 55;        // Minimum RSI value for long confirmation
@@ -51,14 +51,12 @@ datetime g_CurrentDayStart    = 0;
 bool     g_RangeAnnounced     = false;
 
 //--- Pending order and trade state -----------------------------------
-bool     g_TradePlacedToday   = false;
 bool     g_SignalSentBuyToday = false;
 bool     g_SignalSentSellToday= false;
-bool     g_PositionActive     = false;
+bool     g_PendingBuyPlaced   = false;
+bool     g_PendingSellPlaced  = false;
+bool     g_PositionOpen       = false;
 bool     g_MoveToBE_Done      = false;
-double   g_LastRiskDistance   = 0.0;
-double   g_LastEntryPrice     = 0.0;
-double   g_LastStopLoss       = 0.0;
 datetime g_LastSLUpdateTime   = 0;
 
 ulong    g_BuyStopTicket      = 0;
@@ -114,19 +112,68 @@ bool SendTelegram(const string message)
 //+------------------------------------------------------------------+
 //| Time helpers (server/GMT basis)                                  |
 //+------------------------------------------------------------------+
+datetime GetServerTime()
+{
+   datetime server = TimeTradeServer();
+   if(server == 0)
+      server = TimeCurrent();
+   return server;
+}
+
+int GetServerGmtOffsetSeconds()
+{
+   datetime server = GetServerTime();
+   datetime gmt = TimeGMT();
+   // Dynamic GMT offset keeps session times correct across DST without hard-coding.
+   int offset = (int)(server - gmt);
+   if(ManualGMTOffsetHours != 0)
+      offset += ManualGMTOffsetHours * 3600;
+   return offset;
+}
+
 datetime GetBasisTime()
 {
-   datetime now = TimeCurrent();
    if(UseGMT)
-      return now - (ManualGMTOffsetHours * 3600);
-   return now;
+      return TimeGMT();
+   return GetServerTime();
 }
 
 datetime ToServerTime(const datetime basisTime)
 {
    if(UseGMT)
-      return basisTime + (ManualGMTOffsetHours * 3600);
+      return basisTime + GetServerGmtOffsetSeconds();
    return basisTime;
+}
+
+datetime DayStart(const datetime t)
+{
+   MqlDateTime tm;
+   TimeToStruct(t, tm);
+   return t - (tm.hour * 3600 + tm.min * 60 + tm.sec);
+}
+
+void GetSessionWindowForTime(const datetime now, const int startHour, const int endHour,
+                             datetime &windowStart, datetime &windowEnd)
+{
+   datetime dayStart = DayStart(now);
+   windowStart = dayStart + startHour * 3600;
+   windowEnd   = dayStart + endHour * 3600;
+
+   if(windowEnd <= windowStart)
+   {
+      // Session crosses midnight: anchor window around "now" to avoid ambiguous day selection.
+      if(now < windowEnd)
+         windowStart -= 24 * 3600;
+      else
+         windowEnd += 24 * 3600;
+   }
+}
+
+bool IsWithinSession(const datetime now, const int startHour, const int endHour)
+{
+   datetime start, end;
+   GetSessionWindowForTime(now, startHour, endHour, start, end);
+   return (now >= start && now < end);
 }
 
 //+------------------------------------------------------------------+
@@ -189,14 +236,12 @@ void ResetDailyState(const datetime dayStart)
    g_CurrentDayStart  = dayStart;
    g_RangeCalculated  = false;
    g_RangeAnnounced   = false;
-   g_TradePlacedToday = false;
    g_SignalSentBuyToday = false;
    g_SignalSentSellToday = false;
-   g_PositionActive   = false;
+   g_PendingBuyPlaced = false;
+   g_PendingSellPlaced = false;
+   g_PositionOpen     = false;
    g_MoveToBE_Done    = false;
-   g_LastRiskDistance = 0.0;
-   g_LastEntryPrice   = 0.0;
-   g_LastStopLoss     = 0.0;
    g_LastSLUpdateTime = 0;
 
    g_BuyStopTicket    = 0;
@@ -212,17 +257,16 @@ bool CalcAsianRange()
       return true;
 
    datetime now = GetBasisTime();
-   MqlDateTime tm;
-   TimeToStruct(now, tm);
-   if(tm.hour < AsianEndHour)
+   datetime rangeStart = 0;
+   datetime rangeEnd = 0;
+   GetSessionWindowForTime(now, AsianStartHour, AsianEndHour, rangeStart, rangeEnd);
+   if(now < rangeEnd)
       return false;
 
-   datetime dayStart = now - (tm.hour * 3600 + tm.min * 60 + tm.sec);
+   datetime dayStart = DayStart(rangeStart);
    if(dayStart != g_CurrentDayStart)
       ResetDailyState(dayStart);
 
-   datetime rangeStart = dayStart + AsianStartHour * 3600;
-   datetime rangeEnd   = dayStart + AsianEndHour * 3600;
    datetime rangeStartServer = ToServerTime(rangeStart);
    datetime rangeEndServer   = ToServerTime(rangeEnd);
 
@@ -299,7 +343,9 @@ bool GetIndicatorValues(double &emaValue, double &rsiValue, double &atrValue)
 double CalcLotsByRisk(const double entry, const double stopLoss, const ENUM_ORDER_TYPE orderType)
 {
    double riskInMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (RiskPercent / 100.0);
-   double tickValue   = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickValue   = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE_PROFIT);
+   if(tickValue <= 0.0)
+      tickValue = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize    = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_SIZE);
    double minLot      = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
    double maxLot      = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX);
@@ -348,6 +394,20 @@ bool SpreadOK()
    return (spreadPoints <= MaxSpreadPoints);
 }
 
+double GetMinStopDistancePoints()
+{
+   int stopsLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int freezeLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   return (double)MathMax(stopsLevel, freezeLevel);
+}
+
+bool IsPendingOrderType(const long orderType)
+{
+   return (orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP ||
+           orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT ||
+           orderType == ORDER_TYPE_BUY_STOP_LIMIT || orderType == ORDER_TYPE_SELL_STOP_LIMIT);
+}
+
 //+------------------------------------------------------------------+
 //| Cancel pending order                                              |
 //+------------------------------------------------------------------+
@@ -371,9 +431,7 @@ void CancelPending(const ulong ticket, const string reason)
    if(orderSymbol != TradeSymbol || orderMagic != MagicNumber)
       return;
 
-   if(orderType != ORDER_TYPE_BUY_STOP && orderType != ORDER_TYPE_SELL_STOP &&
-      orderType != ORDER_TYPE_BUY_LIMIT && orderType != ORDER_TYPE_SELL_LIMIT &&
-      orderType != ORDER_TYPE_BUY_STOP_LIMIT && orderType != ORDER_TYPE_SELL_STOP_LIMIT)
+   if(!IsPendingOrderType(orderType))
       return;
 
    MqlTradeRequest request;
@@ -429,9 +487,7 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
    double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
    double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
-   int stopsLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_STOPS_LEVEL);
-   int freezeLevel = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_FREEZE_LEVEL);
-   int minLevel = MathMax(stopsLevel, freezeLevel);
+   int minLevel = (int)GetMinStopDistancePoints();
    double minDistance = minLevel * point;
 
    double normEntry = NormalizeDouble(entry, digits);
@@ -445,7 +501,7 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
          Print("Pending buy stop too close to market or within freeze level");
          return false;
       }
-      if((normEntry - normSL) < (stopsLevel * point) || (normTP - normEntry) < (stopsLevel * point))
+      if((normEntry - normSL) < (minLevel * point) || (normTP - normEntry) < (minLevel * point))
       {
          Print("SL/TP distances too close to entry for buy stop");
          return false;
@@ -458,7 +514,7 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
          Print("Pending sell stop too close to market or within freeze level");
          return false;
       }
-      if((normSL - normEntry) < (stopsLevel * point) || (normEntry - normTP) < (stopsLevel * point))
+      if((normSL - normEntry) < (minLevel * point) || (normEntry - normTP) < (minLevel * point))
       {
          Print("SL/TP distances too close to entry for sell stop");
          return false;
@@ -507,7 +563,10 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
    else
       g_SellStopTicket = ticket;
 
-   g_TradePlacedToday = true;
+   if(isBuy)
+      g_PendingBuyPlaced = true;
+   else
+      g_PendingSellPlaced = true;
 
    string msg = StringFormat("\xF0\x9F\xA7\xA2 <b>PENDING SET</b> %s %s @ %.2f\nSL %.2f | TP %.2f | lots %.2f\nTicket %I64u",
                              TradeSymbol, direction, normEntry, normSL, normTP, volume, ticket);
@@ -521,7 +580,11 @@ bool PlacePending(const bool isBuy, const double entry, const double stopLoss, c
 //+------------------------------------------------------------------+
 void TryPlacePendings()
 {
-   if(g_TradePlacedToday || !g_RangeCalculated)
+   if(!g_RangeCalculated)
+      return;
+
+   // Avoid placing new pending orders while a position is open.
+   if(g_PositionOpen)
       return;
 
    double emaValue, rsiValue, atrValue;
@@ -540,29 +603,34 @@ void TryPlacePendings()
    bool emaBull = lastClose > emaValue;
    bool emaBear = lastClose < emaValue;
 
-   bool longOK  = (OnlyOneSideTrend ? emaBull : true) && rsiValue >= RSILongMin && emaBull;
-   bool shortOK = (OnlyOneSideTrend ? emaBear : true) && rsiValue <= RSIShortMax && emaBear;
+   bool rsiConfirmsLong = (rsiValue >= RSILongMin);
+   bool rsiConfirmsShort = (rsiValue <= RSIShortMax);
+   bool rsiNeutral = (!rsiConfirmsLong && !rsiConfirmsShort);
+
+   // RSI confirms direction when extreme; neutral RSI must not block both sides.
+   bool rsiLongOK = rsiConfirmsLong || rsiNeutral;
+   bool rsiShortOK = rsiConfirmsShort || rsiNeutral;
+
+   // EMA filter is optional; when disabled, it must not be redundantly enforced.
+   bool trendLongOK = OnlyOneSideTrend ? emaBull : true;
+   bool trendShortOK = OnlyOneSideTrend ? emaBear : true;
+
+   bool longOK  = trendLongOK && rsiLongOK;
+   bool shortOK = trendShortOK && rsiShortOK;
 
    datetime now = GetBasisTime();
-   MqlDateTime tm;
-   TimeToStruct(now, tm);
-   if(tm.hour < TradeStartHour || tm.hour >= TradeEndHour)
+   if(!IsWithinSession(now, TradeStartHour, TradeEndHour))
       return;
 
-   if(longOK)
+   if(longOK && !g_PendingBuyPlaced)
    {
       double entry = g_AsianHigh + buffer;
       double sl    = entry - atrSL;
       double tp    = entry + RR_TP * (entry - sl);
       PlacePending(true, entry, sl, tp);
-      if(EnableTrading && g_TradePlacedToday)
-         return;
    }
 
-   if(EnableTrading && g_TradePlacedToday)
-      return;
-
-   if(shortOK)
+   if(shortOK && !g_PendingSellPlaced)
    {
       double entry = g_AsianLow - buffer;
       double sl    = entry + atrSL;
@@ -586,7 +654,7 @@ void ManageOpenPositions()
    if(volume <= 0.0)
       return;
 
-   g_PositionActive = true;
+   g_PositionOpen = true;
 
    double entry      = PositionGetDouble(POSITION_PRICE_OPEN);
    double stopLoss   = PositionGetDouble(POSITION_SL);
@@ -595,6 +663,8 @@ void ManageOpenPositions()
    double ask        = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
    double bid        = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
    long   type       = PositionGetInteger(POSITION_TYPE);
+   double spread     = MathMax(0.0, ask - bid);
+   double minDistance = GetMinStopDistancePoints() * point;
 
    double atrValue;
    double emaDummy, rsiDummy;
@@ -611,7 +681,8 @@ void ManageOpenPositions()
       {
          if((bid - entry) >= risk)
          {
-            currentSL = entry;
+            // Break-even must cover spread to avoid a fake BE on brokers with wide spread.
+            currentSL = entry + spread;
             g_MoveToBE_Done = true;
          }
       }
@@ -619,7 +690,7 @@ void ManageOpenPositions()
       {
          if((entry - ask) >= risk)
          {
-            currentSL = entry;
+            currentSL = entry - spread;
             g_MoveToBE_Done = true;
          }
       }
@@ -631,13 +702,15 @@ void ManageOpenPositions()
       if(type == POSITION_TYPE_BUY)
       {
          double newSL = bid - trailDistance;
-         if(newSL > currentSL)
+         double minBE = entry + spread;
+         if(newSL > currentSL && newSL >= minBE)
             currentSL = newSL;
       }
       else if(type == POSITION_TYPE_SELL)
       {
          double newSL = ask + trailDistance;
-         if(newSL < currentSL)
+         double maxBE = entry - spread;
+         if(newSL < currentSL && newSL <= maxBE)
             currentSL = newSL;
       }
    }
@@ -645,7 +718,16 @@ void ManageOpenPositions()
    int digits = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_DIGITS);
    currentSL = NormalizeDouble(currentSL, digits);
 
-   if(MathAbs(currentSL - stopLoss) >= (MinSLUpdatePoints * point) &&
+   bool slDistanceOK = false;
+   if(type == POSITION_TYPE_BUY)
+      slDistanceOK = (bid - currentSL) >= minDistance;
+   else if(type == POSITION_TYPE_SELL)
+      slDistanceOK = (currentSL - ask) >= minDistance;
+
+   bool improves = (type == POSITION_TYPE_BUY) ? (currentSL > stopLoss) : (currentSL < stopLoss);
+
+   if(improves && slDistanceOK &&
+      MathAbs(currentSL - stopLoss) >= (MinSLUpdatePoints * point) &&
       (TimeCurrent() - g_LastSLUpdateTime) >= MinSLUpdateSeconds)
    {
       MqlTradeRequest request;
@@ -685,20 +767,86 @@ void CancelExpiredPendings()
       return;
 
    datetime now = GetBasisTime();
-   MqlDateTime tm;
-   TimeToStruct(now, tm);
-   if(tm.hour < TradeEndHour)
+   if(IsWithinSession(now, TradeStartHour, TradeEndHour))
       return;
 
    if(g_BuyStopTicket != 0)
    {
       CancelPending(g_BuyStopTicket, "Window ended");
       g_BuyStopTicket = 0;
+      g_PendingBuyPlaced = false;
    }
    if(g_SellStopTicket != 0)
    {
       CancelPending(g_SellStopTicket, "Window ended");
       g_SellStopTicket = 0;
+      g_PendingSellPlaced = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Sync internal state with broker (defensive against restarts)      |
+//+------------------------------------------------------------------+
+void SyncTradeState()
+{
+   g_PendingBuyPlaced = false;
+   g_PendingSellPlaced = false;
+
+   if(g_BuyStopTicket != 0 && OrderSelect(g_BuyStopTicket))
+      g_PendingBuyPlaced = true;
+   else
+      g_BuyStopTicket = 0;
+
+   if(g_SellStopTicket != 0 && OrderSelect(g_SellStopTicket))
+      g_PendingSellPlaced = true;
+   else
+      g_SellStopTicket = 0;
+
+   if(g_BuyStopTicket == 0 || g_SellStopTicket == 0)
+   {
+      int total = OrdersTotal();
+      for(int i = 0; i < total; ++i)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(!OrderSelect(ticket))
+            continue;
+         string orderSymbol = OrderGetString(ORDER_SYMBOL);
+         long orderMagic = OrderGetInteger(ORDER_MAGIC);
+         long orderType = OrderGetInteger(ORDER_TYPE);
+         if(orderSymbol != TradeSymbol || orderMagic != MagicNumber || !IsPendingOrderType(orderType))
+            continue;
+
+         if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY_STOP_LIMIT)
+         {
+            g_BuyStopTicket = ticket;
+            g_PendingBuyPlaced = true;
+         }
+         else if(orderType == ORDER_TYPE_SELL_STOP || orderType == ORDER_TYPE_SELL_STOP_LIMIT)
+         {
+            g_SellStopTicket = ticket;
+            g_PendingSellPlaced = true;
+         }
+      }
+   }
+
+   g_PositionOpen = false;
+   if(PositionSelect(TradeSymbol) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+   {
+      g_PositionOpen = true;
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+      double spread = MathMax(0.0, ask - bid);
+      long type = PositionGetInteger(POSITION_TYPE);
+      if(type == POSITION_TYPE_BUY)
+         g_MoveToBE_Done = (sl >= entry + spread);
+      else if(type == POSITION_TYPE_SELL)
+         g_MoveToBE_Done = (sl <= entry - spread);
+   }
+   else
+   {
+      g_MoveToBE_Done = false;
    }
 }
 
@@ -717,6 +865,9 @@ int OnInit()
 
    if(!EnsureIndicators())
       return INIT_FAILED;
+
+   if(UseGMT && ManualGMTOffsetHours != 0)
+      PrintFormat("Manual GMT offset enabled (%d hours). Ensure broker time drift is handled.", ManualGMTOffsetHours);
 
    string msg = StringFormat("\xF0\x9F\x9A\x80 <b>EA Started</b> %s\nTrading %s", TradeSymbol, EnableTrading ? "ENABLED" : "DISABLED");
    SendTelegram(msg);
@@ -744,14 +895,16 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    datetime now = GetBasisTime();
-   MqlDateTime tm;
-   TimeToStruct(now, tm);
-   datetime dayStart = now - (tm.hour * 3600 + tm.min * 60 + tm.sec);
+   datetime rangeStart = 0;
+   datetime rangeEnd = 0;
+   GetSessionWindowForTime(now, AsianStartHour, AsianEndHour, rangeStart, rangeEnd);
+   datetime dayStart = DayStart(rangeStart);
 
    if(dayStart != g_CurrentDayStart)
       ResetDailyState(dayStart);
 
    CalcAsianRange();
+   SyncTradeState();
    TryPlacePendings();
    CancelExpiredPendings();
    ManageOpenPositions();
@@ -779,17 +932,10 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
       if(dealType == DEAL_TYPE_BUY || dealType == DEAL_TYPE_SELL)
       {
-         g_PositionActive = true;
-         g_TradePlacedToday = true;
+         g_PositionOpen = true;
          g_MoveToBE_Done = false;
-         g_LastEntryPrice = price;
-         g_LastRiskDistance = 0.0;
-
-         if(PositionSelect(TradeSymbol) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-         {
-            g_LastStopLoss = PositionGetDouble(POSITION_SL);
-            g_LastRiskDistance = MathAbs(PositionGetDouble(POSITION_PRICE_OPEN) - g_LastStopLoss);
-         }
+         g_PendingBuyPlaced = false;
+         g_PendingSellPlaced = false;
 
          string msg = StringFormat("\xE2\x9C\x85 <b>ENTRY</b> %s %s @ %.2f (deal %I64u)",
                                    TradeSymbol,
@@ -816,7 +962,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                                    label, TradeSymbol, price, profit);
          SendTelegram(msg);
          Print(msg);
-         g_PositionActive = false;
+         g_PositionOpen = false;
          g_MoveToBE_Done = false;
       }
    }
@@ -827,9 +973,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
       ulong ticket = trans.order;
       if(ticket == g_BuyStopTicket)
+      {
          g_BuyStopTicket = 0;
+         g_PendingBuyPlaced = false;
+      }
       if(ticket == g_SellStopTicket)
+      {
          g_SellStopTicket = 0;
+         g_PendingSellPlaced = false;
+      }
    }
 }
 //+------------------------------------------------------------------+
