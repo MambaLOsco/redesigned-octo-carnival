@@ -350,7 +350,10 @@ double CalcLotsByRisk(const double entry, const double stopLoss, const ENUM_ORDE
    double minLot      = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
    double maxLot      = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX);
    double lotStep     = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_STEP);
-   int    lotDigits   = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_VOLUME_DIGITS);
+   int    lotDigits   = 0;
+
+   if(lotStep > 0.0)
+      lotDigits = (int)MathMax(0.0, MathRound(-MathLog10(lotStep)));
 
    double stopDistance = MathAbs(entry - stopLoss);
    if(stopDistance <= 0.0 || tickValue <= 0.0 || tickSize <= 0.0 || lotStep <= 0.0)
@@ -922,15 +925,21 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
-      if(trans.magic != MagicNumber)
+      ulong dealTicket = trans.deal;
+      if(dealTicket == 0)
          return;
 
-      ulong dealTicket = trans.deal;
+      long dealMagic = (long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+      if(dealMagic != MagicNumber)
+         return;
+
       double price     = trans.price;
       double profit    = trans.profit;
-      long dealType    = trans.deal_type;
+      long dealType    = (long)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+      long dealEntry   = (long)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+      long dealReason  = (long)HistoryDealGetInteger(dealTicket, DEAL_REASON);
 
-      if(dealType == DEAL_TYPE_BUY || dealType == DEAL_TYPE_SELL)
+      if(dealEntry == DEAL_ENTRY_IN || dealEntry == DEAL_ENTRY_INOUT)
       {
          g_PositionOpen = true;
          g_MoveToBE_Done = false;
@@ -955,9 +964,13 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             g_BuyStopTicket = 0;
          }
       }
-      else if(dealType == DEAL_TYPE_SL || dealType == DEAL_TYPE_TP || dealType == DEAL_TYPE_CLOSE)
+      else if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
       {
-         string label = (dealType == DEAL_TYPE_TP) ? "TP" : (dealType == DEAL_TYPE_SL ? "SL" : "CLOSE");
+         string label = "CLOSE";
+         if(dealReason == DEAL_REASON_TP)
+            label = "TP";
+         else if(dealReason == DEAL_REASON_SL)
+            label = "SL";
          string msg = StringFormat("\xF0\x9F\x94\x9A <b>%s</b> %s @ %.2f | P/L %.2f",
                                    label, TradeSymbol, price, profit);
          SendTelegram(msg);
@@ -968,7 +981,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    }
    else if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
    {
-      if(trans.magic != MagicNumber)
+      long orderMagic = (long)HistoryOrderGetInteger(trans.order, ORDER_MAGIC);
+      if(orderMagic != MagicNumber)
          return;
 
       ulong ticket = trans.order;
