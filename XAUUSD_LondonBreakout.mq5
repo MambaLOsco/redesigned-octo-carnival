@@ -10,7 +10,7 @@
 //--- Input parameters -------------------------------------------------
 input string TELEGRAM_TOKEN      = "";        // Telegram bot token from @BotFather
 input string TELEGRAM_CHAT_ID    = "";        // Telegram chat/channel identifier (can be negative)
-input string TradeSymbol         = _Symbol;   // Symbol to trade (supports broker suffixes)
+input string InpTradeSymbol      = "";        // Symbol to trade (supports broker suffixes); blank uses chart symbol
 input bool   EnableTrading       = false;     // Enable automated order placement
 input long   MagicNumber         = 123456;    // Magic number for identifying EA trades
 input ENUM_TIMEFRAMES RangeTF    = PERIOD_M15;// Timeframe used to compute Asian range and indicators
@@ -37,6 +37,9 @@ input double Trail_ATR_mult      = 1.0;       // ATR multiplier for trailing sto
 input int    Slippage            = 30;        // Maximum slippage in points when sending orders
 input int    MinSLUpdatePoints   = 30;        // Minimum SL change in points to modify
 input int    MinSLUpdateSeconds  = 20;        // Minimum seconds between SL modifications
+
+//--- Resolved trade symbol --------------------------------------------
+string TradeSymbol = "";
 
 //--- Indicator handles ------------------------------------------------
 int  g_handleEMA = INVALID_HANDLE;
@@ -68,11 +71,11 @@ ulong    g_SellStopTicket     = 0;
 string JsonEscape(const string text)
 {
    string result = text;
-   result = StringReplace(result, "\\", "\\\\");
-   result = StringReplace(result, "\"", "\\\"");
-   result = StringReplace(result, "\n", "\\n");
-   result = StringReplace(result, "\r", "\\r");
-   result = StringReplace(result, "\t", "\\t");
+   StringReplace(result, "\\", "\\\\");
+   StringReplace(result, "\"", "\\\"");
+   StringReplace(result, "\n", "\\n");
+   StringReplace(result, "\r", "\\r");
+   StringReplace(result, "\t", "\\t");
    return result;
 }
 
@@ -753,8 +756,7 @@ void ManageOpenPositions()
          g_LastSLUpdateTime = TimeCurrent();
       }
       else if(result.retcode != TRADE_RETCODE_DONE &&
-              result.retcode != TRADE_RETCODE_REQUOTE &&
-              result.retcode != TRADE_RETCODE_TRADE_CONTEXT_BUSY)
+              result.retcode != TRADE_RETCODE_REQUOTE)
       {
          PrintFormat("Failed to modify position SL. Retcode=%d", result.retcode);
       }
@@ -860,6 +862,7 @@ int OnInit()
 {
    ResetDailyState(0);
 
+   TradeSymbol = (StringLen(InpTradeSymbol) == 0 ? _Symbol : InpTradeSymbol);
    if(StringLen(TradeSymbol) == 0 || !SymbolSelect(TradeSymbol, true))
    {
       Print("TradeSymbol not available or cannot be selected");
@@ -934,7 +937,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          return;
 
       double price     = trans.price;
-      double profit    = trans.profit;
+      double profit    = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
       long dealType    = (long)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
       long dealEntry   = (long)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
       long dealReason  = (long)HistoryDealGetInteger(dealTicket, DEAL_REASON);
